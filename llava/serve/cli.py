@@ -1,11 +1,11 @@
 import argparse
 import torch
 
-from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-from llava.conversation import conv_templates, SeparatorStyle
-from llava.model.builder import load_pretrained_model
-from llava.utils import disable_torch_init
-from llava.mm_utils import process_images, tokenizer_image_token, get_model_name_from_path
+from LLaVA.llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from LLaVA.llava.conversation import conv_templates, SeparatorStyle
+from LLaVA.llava.model.builder import load_pretrained_model
+from LLaVA.llava.utils import disable_torch_init
+from LLaVA.llava.mm_utils import process_images, tokenizer_image_token, get_model_name_from_path
 
 from PIL import Image
 
@@ -24,13 +24,52 @@ def load_image(image_file):
     return image
 
 
-def main(args):
-    # Model
+def generate_response(model, tokenizer, image_processor, image_file, prompt, args):
+    image = load_image(image_file)
+    image_size = image.size
+    image_tensor = process_images([image], image_processor, model.config)
+    if type(image_tensor) is list:
+        image_tensor = [image.to(model.device, dtype=torch.float16) for image in image_tensor]
+    else:
+        image_tensor = image_tensor.to(model.device, dtype=torch.float16)
+
+    if model.config.mm_use_im_start_end:
+        prompt = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + prompt
+    else:
+        prompt = DEFAULT_IMAGE_TOKEN + '\n' + prompt
+
+    input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(
+        model.device)
+    streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+    with torch.inference_mode():
+        output_ids = model.generate(
+            input_ids,
+            images=image_tensor,
+            image_sizes=[image_size],
+            do_sample=True if args.temperature > 0 else False,
+            temperature=args.temperature,
+            max_new_tokens=args.max_new_tokens,
+            streamer=None,
+            use_cache=True)
+
+    output = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+    return output
+
+
+def initialize_model(args):
     disable_torch_init()
-
     model_name = get_model_name_from_path(args.model_path)
-    tokenizer, model, image_processor, context_len = load_pretrained_model(args.model_path, args.model_base, model_name, args.load_8bit, args.load_4bit, device=args.device)
+    tokenizer, model, image_processor, context_len = load_pretrained_model(args.model_path, args.model_base, model_name,
+                                                                           args.load_8bit, args.load_4bit,
+                                                                           device=args.device)
+    return model_name, tokenizer, model, image_processor
 
+
+def main(args):
+    model_name, tokenizer, model, image_processor = initialize_model(args)
+
+    # Determine conversation mode
     if "llama-2" in model_name.lower():
         conv_mode = "llava_llama_2"
     elif "mistral" in model_name.lower():
@@ -45,24 +84,15 @@ def main(args):
         conv_mode = "llava_v0"
 
     if args.conv_mode is not None and conv_mode != args.conv_mode:
-        print('[WARNING] the auto inferred conversation mode is {}, while `--conv-mode` is {}, using {}'.format(conv_mode, args.conv_mode, args.conv_mode))
+        print(
+            '[WARNING] the auto inferred conversation mode is {}, while `--conv-mode` is {}, using {}'.format(conv_mode,
+                                                                                                              args.conv_mode,
+                                                                                                              args.conv_mode))
     else:
         args.conv_mode = conv_mode
 
     conv = conv_templates[args.conv_mode].copy()
-    if "mpt" in model_name.lower():
-        roles = ('user', 'assistant')
-    else:
-        roles = conv.roles
-
-    image = load_image(args.image_file)
-    image_size = image.size
-    # Similar operation in model_worker.py
-    image_tensor = process_images([image], image_processor, model.config)
-    if type(image_tensor) is list:
-        image_tensor = [image.to(model.device, dtype=torch.float16) for image in image_tensor]
-    else:
-        image_tensor = image_tensor.to(model.device, dtype=torch.float16)
+    roles = ('user', 'assistant') if "mpt" in model_name.lower() else conv.roles
 
     while True:
         try:
@@ -75,39 +105,11 @@ def main(args):
 
         print(f"{roles[1]}: ", end="")
 
-        if image is not None:
-            # first message
-            if model.config.mm_use_im_start_end:
-                inp = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + inp
-            else:
-                inp = DEFAULT_IMAGE_TOKEN + '\n' + inp
-            image = None
-        
-        conv.append_message(conv.roles[0], inp)
-        conv.append_message(conv.roles[1], None)
-        prompt = conv.get_prompt()
-
-        input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(model.device)
-        stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
-        keywords = [stop_str]
-        streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-
-        with torch.inference_mode():
-            output_ids = model.generate(
-                input_ids,
-                images=image_tensor,
-                image_sizes=[image_size],
-                do_sample=True if args.temperature > 0 else False,
-                temperature=args.temperature,
-                max_new_tokens=args.max_new_tokens,
-                streamer=streamer,
-                use_cache=True)
-
-        outputs = tokenizer.decode(output_ids[0]).strip()
-        conv.messages[-1][-1] = outputs
+        output = generate_response(model, tokenizer, image_processor, args.image_file, inp, args)
+        print(output)
 
         if args.debug:
-            print("\n", {"prompt": prompt, "outputs": outputs}, "\n")
+            print("\n", {"prompt": inp, "outputs": output}, "\n")
 
 
 if __name__ == "__main__":
