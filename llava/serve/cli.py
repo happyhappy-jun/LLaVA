@@ -25,7 +25,7 @@ def load_image(image_file):
 
 
 def generate_response(model, tokenizer, image_processor, image_file, prompt, args):
-    image = load_image(image_file)
+    image = image_file
     image_size = image.size
     image_tensor = process_images([image], image_processor, model.config)
     if type(image_tensor) is list:
